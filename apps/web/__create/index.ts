@@ -53,12 +53,68 @@ app.use('*', (c, next) => {
 
 app.use(contextStorage());
 
+// Security headers
+app.use('*', async (c, next) => {
+  await next();
+  c.res.headers.set('X-Content-Type-Options', 'nosniff');
+  c.res.headers.set('X-Frame-Options', 'DENY');
+  c.res.headers.set('X-XSS-Protection', '1; mode=block');
+  c.res.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  c.res.headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  if (process.env.NODE_ENV === 'production') {
+    c.res.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+});
+
+// Rate limiting for API routes (in-memory, per-IP, resets on restart)
+const rateLimitStore = new Map<string, { count: number; resetAt: number }>();
+const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const RATE_LIMIT_MAX = 100;
+const AUTH_RATE_LIMIT_MAX = 20;
+
+app.use('/api/*', async (c, next) => {
+  const ip = c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown';
+  const isAuthRoute = c.req.path.startsWith('/api/auth');
+  const max = isAuthRoute ? AUTH_RATE_LIMIT_MAX : RATE_LIMIT_MAX;
+  const now = Date.now();
+
+  let entry = rateLimitStore.get(ip);
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+    rateLimitStore.set(ip, entry);
+  }
+
+  entry.count++;
+  c.res.headers.set('X-RateLimit-Limit', String(max));
+  c.res.headers.set('X-RateLimit-Remaining', String(Math.max(0, max - entry.count)));
+  c.res.headers.set('X-RateLimit-Reset', String(Math.ceil(entry.resetAt / 1000)));
+
+  if (entry.count > max) {
+    return c.json({ error: 'Too many requests. Please try again later.' }, 429);
+  }
+
+  return next();
+});
+
+// Periodic cleanup of rate limit store
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rateLimitStore) {
+    if (now > entry.resetAt) rateLimitStore.delete(key);
+  }
+}, 60 * 1000);
+
 app.onError((err, c) => {
+  const isDev = process.env.NODE_ENV !== 'production';
+  if (isDev) {
+    console.error(`[${c.get('requestId')}] Error:`, err.message || err);
+  }
+
   if (c.req.method !== 'GET') {
     return c.json(
       {
         error: 'An error occurred in your app',
-        details: serializeError(err),
+        ...(isDev ? { details: serializeError(err) } : {}),
       },
       500
     );
